@@ -1,4 +1,4 @@
-# Diffusion-based Extreme Image Compression with Compressed Feature Initialization
+# RDEIC: Accelerating Diffusion-Based Extreme Image Compression with Relay Residual Diffusion
 
 > [Zhiyuan Li](https://github.com/huai-chang), Yanhui Zhou, [Hao Wei](https://github.com/cshw2021), Chenyang Ge, [Ajmal Mian](https://research-repository.uwa.edu.au/en/persons/ajmal-mian)<br>
  
