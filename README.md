@@ -1,6 +1,6 @@
 # RDEIC: Accelerating Diffusion-Based Extreme Image Compression with Relay Residual Diffusion
 
-> [Zhiyuan Li](https://github.com/huai-chang), Yanhui Zhou, [Hao Wei](https://github.com/cshw2021), Chenyang Ge, [Ajmal Mian](https://research-repository.uwa.edu.au/en/persons/ajmal-mian)
+> [Zhiyuan Li](https://github.com/huai-chang), Yanhui Zhou, [Hao Wei](https://github.com/cshw2021), Chenyang Ge, [Ajmal Mian](https://research-repository.uwa.edu.au/en/persons/ajmal-mian)<br>
 > :partying_face: This work is accepted by IEEE Transactions on Circuits and Systems for Video Technology.
  
 :star: The quantitative metrics for each method presented in our paper can be found in [result.xlsx](/indicators/results.xlsx).
