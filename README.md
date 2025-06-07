@@ -110,6 +110,7 @@ pip install -r requirements.txt
 
    # ./configs/model/rdeic.yaml
    is_refine: True
+   fixed_step: 2 or 5
    learning_rate: 2e-5
    l_guide_weight: 2 #{2,1,0.5,0.25,0.1}
 
