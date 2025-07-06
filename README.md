@@ -62,7 +62,9 @@ pip install -r requirements.txt
 ## <a name="train"></a>:computer: Train
 
 ### Preparation
-1. Generate file list of training set and validation set.
+1. Download [LSDIR dataset](https://pan.baidu.com/s/1IvowtZSRAPn_CnhhASEqgw?pwd=nck8).
+   
+2. Generate file list of training set and validation set.
 
    ```
    python3 make_fire_list.py\
@@ -78,7 +80,7 @@ pip install -r requirements.txt
    └── valid.list # validation file list
    ```
 
-2. Download pretrained [Stable Diffusion v2.1](https://huggingface.co/stabilityai/stable-diffusion-2-1-base) into `./weight`.
+3. Download pretrained [Stable Diffusion v2.1](https://huggingface.co/stabilityai/stable-diffusion-2-1-base) into `./weight`.
    ```
    wget https://huggingface.co/stabilityai/stable-diffusion-2-1-base/resolve/main/v2-1_512-ema-pruned.ckpt --no-check-certificate
    ```
