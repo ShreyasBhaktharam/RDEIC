@@ -2,6 +2,8 @@ from typing import List, Tuple, Optional
 import os
 os.environ['CUDA_VISIBLE_DEVICES'] = '0'
 from argparse import ArgumentParser, Namespace
+import warnings
+import logging
 
 import numpy as np
 import torch
@@ -25,10 +27,16 @@ def process(
     imgs: List[np.ndarray],
     sampler: str,
     steps: int,
-    stream_path: str,
+    stream_paths: List[str],
     guidance_scale: float,
     c_crossattn: List[torch.Tensor],
-) -> Tuple[List[np.ndarray], float]:
+    micro_batch_size: Optional[int] = None,
+    use_fp16: bool = False,
+    profile_memory: bool = False,
+    save_intermediates: bool = False,
+    intermediate_prefixes: Optional[List[str]] = None,
+    latent_format: str = "pt",
+) -> Tuple[List[np.ndarray], List[float]]:
     """
     Apply RDEIC model on a list of images.
     
@@ -37,13 +45,14 @@ def process(
         imgs (List[np.ndarray]): A list of images (HWC, RGB, range in [0, 255])
         sampler (str): Sampler name.
         steps (int): Sampling steps.
-        stream_path (str): Savedir of bitstream
+        stream_paths (List[str]): List of savedirs for bitstreams, one per image
     
     Returns:
         preds (List[np.ndarray]): Restoration results (HWC, RGB, range in [0, 255]).
-        bpp
+        bpps (List[float]): Bits-per-pixel for each image
     """
     n_samples = len(imgs)
+    assert n_samples == len(stream_paths), "imgs and stream_paths must have the same length"
     if sampler == "ddpm":
         sampler = SpacedSampler(model, var_type="fixed_small")
     else:
@@ -52,43 +61,128 @@ def process(
     control = einops.rearrange(control, "n h w c -> n c h w").contiguous()
     
     height, width = control.size(-2), control.size(-1)
-    bpp = model.apply_condition_compress(control, stream_path, height, width)
-    c_latent, guide_hint = model.apply_condition_decompress(stream_path)
+    # Per-sample compression/decompression to allow individual bitstreams
+    bpps: List[float] = []
+    c_latents: List[torch.Tensor] = []
+    guide_hints: List[torch.Tensor] = []
+    if profile_memory and torch.cuda.is_available() and model.device.type == "cuda":
+        print(f"[mem] before compress: alloc={torch.cuda.memory_allocated() / 1e9:.3f} GB, reserved={torch.cuda.memory_reserved() / 1e9:.3f} GB")
+    for i in range(n_samples):
+        control_i = control[i : i + 1]
+        bpp_i = model.apply_condition_compress(control_i, stream_paths[i], height, width)
+        c_latent_i, guide_hint_i = model.apply_condition_decompress(stream_paths[i])
+        bpps.append(bpp_i)
+        c_latents.append(c_latent_i)
+        guide_hints.append(guide_hint_i)
+        if save_intermediates:
+            assert intermediate_prefixes is not None and len(intermediate_prefixes) == n_samples, "intermediate_prefixes must match batch size"
+            prefix = intermediate_prefixes[i]
+            # Save latent
+            latent_to_save = c_latent_i.detach().cpu()
+            if latent_format == "npy":
+                np.save(f"{prefix}_latent.npy", latent_to_save.numpy())
+            else:
+                torch.save(latent_to_save, f"{prefix}_latent.pt")
+            # Save a visualization of the guide hint (and a decoded compressed image if possible)
+            try:
+                gh = guide_hint_i.detach().float().cpu()
+                # Normalize per-tensor to 0..1 for visualization
+                gh_min = gh.min()
+                gh_max = gh.max()
+                gh = (gh - gh_min) / (gh_max - gh_min + 1e-8)
+                if gh.dim() == 4:
+                    # shape (1, C, H, W)
+                    gh = gh[0]
+                if gh.shape[0] >= 3:
+                    gh_vis = gh[:3]
+                else:
+                    gh_vis = gh[:1].repeat(3, 1, 1)
+                gh_vis = einops.rearrange(gh_vis, "c h w -> h w c").numpy()
+                gh_vis = (gh_vis * 255.0).clip(0, 255).astype(np.uint8)
+                Image.fromarray(gh_vis).save(f"{prefix}_guide.png")
+            except Exception:
+                pass
+            try:
+                # Attempt to decode c_latent to an RGB for a "compressed image" preview
+                with torch.no_grad():
+                    dec = model.decode_first_stage(c_latent_i.to(model.device))
+                dec = ((dec + 1) / 2).clamp(0, 1)
+                dec_np = (einops.rearrange(dec.detach().cpu(), "b c h w -> b h w c").numpy() * 255.0).clip(0, 255).astype(np.uint8)
+                Image.fromarray(dec_np[0]).save(f"{prefix}_compressed.png")
+            except Exception:
+                pass
+    c_latent = torch.cat(c_latents, dim=0)
+    guide_hint = torch.cat(guide_hints, dim=0)
     cond = {
         "c_latent": [c_latent],
         "c_crossattn": c_crossattn,
         "guide_hint": guide_hint
     }
     
-    shape = (n_samples, 4, height // 8, width // 8)
-    x_T = torch.randn(shape, device=model.device, dtype=torch.float32)
-    noise = torch.randn(shape, device=model.device, dtype=torch.float32)
-    t = torch.ones((n_samples,)).long().to(model.device) * model.used_timesteps - 1
-    x_T = model.q_sample(x_start=c_latent, t=t, noise=noise)
-    if isinstance(sampler, SpacedSampler):
-        samples = sampler.sample(
-            steps, shape, cond,
-            unconditional_guidance_scale=guidance_scale,
-            unconditional_conditioning=None,
-            cond_fn=None, x_T=x_T
-        )
-    else:
-        sampler: DDIMSampler
-        samples, _ = sampler.sample(
-            S=steps, batch_size=shape[0], shape=shape[1:],
-            conditioning=cond, unconditional_conditioning=None,
-            unconditional_guidance_scale=guidance_scale,
-            x_T=x_T, eta=0
-        )
+    latent_shape = (n_samples, 4, height // 8, width // 8)
+    preds: List[np.ndarray] = []
+    # Enable micro-batching for the expensive sampling/decoding stage
+    chunk_size = micro_batch_size or n_samples
+    if profile_memory and torch.cuda.is_available() and model.device.type == "cuda":
+        print(f"[mem] before sampling: alloc={torch.cuda.memory_allocated() / 1e9:.3f} GB, reserved={torch.cuda.memory_reserved() / 1e9:.3f} GB")
+    for start in range(0, n_samples, chunk_size):
+        end = min(start + chunk_size, n_samples)
+        bs = end - start
+        # Prepare per-chunk conditioning
+        c_latent_chunk = c_latent[start:end]
+        guide_hint_chunk = guide_hint[start:end]
+        # repeat text conditioning to chunk size if needed
+        if isinstance(c_crossattn, list) and len(c_crossattn) > 0 and hasattr(c_crossattn[0], "shape"):
+            c_crossattn_chunk = [c_crossattn[0].repeat(bs, 1, 1)]
+        else:
+            c_crossattn_chunk = c_crossattn
+        cond_chunk = {
+            "c_latent": [c_latent_chunk],
+            "c_crossattn": c_crossattn_chunk,
+            "guide_hint": guide_hint_chunk
+        }
+        shape = (bs, latent_shape[1], latent_shape[2], latent_shape[3])
+        # Create noise only once per chunk
+        t = torch.ones((bs,)).long().to(model.device) * model.used_timesteps - 1
+        noise = torch.randn(shape, device=model.device, dtype=torch.float32)
+        x_T = model.q_sample(x_start=c_latent_chunk, t=t, noise=noise)
+        del noise
+        if use_fp16 and model.device.type == "cuda":
+            amp_ctx = torch.cuda.amp.autocast(dtype=torch.float16)
+        else:
+            # no-op context manager
+            class _NullCtx:
+                def __enter__(self): return None
+                def __exit__(self, exc_type, exc_val, exc_tb): return False
+            amp_ctx = _NullCtx()
+        with amp_ctx:
+            if isinstance(sampler, SpacedSampler):
+                samples_chunk = sampler.sample(
+                    steps, shape, cond_chunk,
+                    unconditional_guidance_scale=guidance_scale,
+                    unconditional_conditioning=None,
+                    cond_fn=None, x_T=x_T
+                )
+            else:
+                sampler_ddim: DDIMSampler = sampler
+                samples_chunk, _ = sampler_ddim.sample(
+                    S=steps, batch_size=shape[0], shape=shape[1:],
+                    conditioning=cond_chunk, unconditional_conditioning=None,
+                    unconditional_guidance_scale=guidance_scale,
+                    x_T=x_T, eta=0
+                )
+            x_samples = model.decode_first_stage(samples_chunk)
+        x_samples = ((x_samples + 1) / 2).clamp(0, 1)
+        x_samples = (einops.rearrange(x_samples, "b c h w -> b h w c") * 255).cpu().numpy().clip(0, 255).astype(np.uint8)
+        preds.extend([x_samples[i] for i in range(bs)])
+        # Free chunk tensors
+        del x_T, samples_chunk, x_samples, c_latent_chunk, guide_hint_chunk
+        if torch.cuda.is_available() and model.device.type == "cuda":
+            torch.cuda.empty_cache()
+            if profile_memory:
+                print(f"[mem] after chunk {start}-{end}: alloc={torch.cuda.memory_allocated() / 1e9:.3f} GB, reserved={torch.cuda.memory_reserved() / 1e9:.3f} GB")
     
-    x_samples = model.decode_first_stage(samples)
-    x_samples = ((x_samples + 1) / 2).clamp(0, 1)
-    
-    x_samples = (einops.rearrange(x_samples, "b c h w -> b h w c") * 255).cpu().numpy().clip(0, 255).astype(np.uint8)
-    
-    preds = [x_samples[i] for i in range(n_samples)]
-    
-    return preds, bpp
+    return preds, bpps
 
 
 def parse_args() -> Namespace:
@@ -108,12 +202,25 @@ def parse_args() -> Namespace:
     
     parser.add_argument("--seed", type=int, default=231)
     parser.add_argument("--device", type=str, default="cuda", choices=["cpu", "cuda"])
+    parser.add_argument("--batch_size", type=int, default=1, help="number of images to process together (grouped by resolution)")
+    parser.add_argument("--suppress_warnings", action="store_true", help="suppress Python warnings and set logging to ERROR")
+    parser.add_argument("--micro_batch_size", type=int, default=0, help="split each batch into smaller chunks during sampling to reduce VRAM")
+    parser.add_argument("--fp16", action="store_true", help="use autocast float16 during sampling/decoding (CUDA only)")
+    parser.add_argument("--profile_memory", action="store_true", help="print CUDA memory usage before/after key steps")
+    parser.add_argument("--save_intermediates", action="store_true", help="save guide hint preview and latent per image")
+    parser.add_argument("--latent_format", type=str, default="pt", choices=["pt", "npy"], help="format to save latent tensors")
     
     return parser.parse_args()
 
 
 def main() -> None:
     args = parse_args()
+    if args.suppress_warnings:
+        # Silence Python warnings and lower logging noise
+        warnings.filterwarnings("ignore")
+        os.environ["PYTHONWARNINGS"] = "ignore"
+        logging.getLogger().setLevel(logging.ERROR)
+        logging.getLogger("pytorch_lightning").setLevel(logging.ERROR)
     pl.seed_everything(args.seed)
     
     if args.device == "cpu":
@@ -136,32 +243,67 @@ def main() -> None:
     c_crossattn =  [model.get_learned_conditioning([""])]
     
     print(f"sampling {args.steps} steps using {args.sampler} sampler")
-    for file_path in list_image_files(args.input, follow_links=True):
+    # Group files by padded resolution so they can be batched safely
+    files = list(list_image_files(args.input, follow_links=True))
+    groups = {}
+    image_meta = {}
+    for file_path in files:
         img = Image.open(file_path).convert("RGB")
-        x = pad(np.array(img), scale=64)
-        
-        save_path = os.path.join(args.output, os.path.relpath(file_path, args.input))
-        parent_path, stem, _ = get_file_name_parts(save_path)
-        stream_parent_path = os.path.join(parent_path, 'data')
-        save_path = os.path.join(parent_path, f"{stem}.png")
-        stream_path = os.path.join(stream_parent_path, f"{stem}")
-
-        os.makedirs(parent_path, exist_ok=True)
-        os.makedirs(stream_parent_path, exist_ok=True)
-        
-        preds, bpp = process(
-            model, [x], steps=args.steps, sampler=args.sampler,
-            stream_path=stream_path, guidance_scale=args.guidance_scale, c_crossattn=c_crossattn
-        )
-        pred = preds[0]
-
-        bpps.append(bpp)
-        
-        # remove padding
-        pred = pred[:img.height, :img.width, :]
-
-        Image.fromarray(pred).save(save_path)
-        print(f"save to {save_path}, bpp {bpp}")
+        w, h = img.size
+        # compute padded dims (multiple of 64)
+        pad_h = ((h + 63) // 64) * 64
+        pad_w = ((w + 63) // 64) * 64
+        key = (pad_h, pad_w)
+        groups.setdefault(key, []).append(file_path)
+        image_meta[file_path] = {"orig_h": h, "orig_w": w}
+    for (pad_h, pad_w), file_paths in groups.items():
+        bs = max(1, int(args.batch_size))
+        for i in range(0, len(file_paths), bs):
+            batch_files = file_paths[i:i + bs]
+            imgs = []
+            save_paths = []
+            stream_paths = []
+            intermediate_prefixes = []
+            orig_sizes = []
+            for file_path in batch_files:
+                img = Image.open(file_path).convert("RGB")
+                x = pad(np.array(img), scale=64)
+                imgs.append(x)
+                save_path = os.path.join(args.output, os.path.relpath(file_path, args.input))
+                parent_path, stem, _ = get_file_name_parts(save_path)
+                stream_parent_path = os.path.join(parent_path, 'data')
+                save_path = os.path.join(parent_path, f"{stem}.png")
+                stream_path = os.path.join(stream_parent_path, f"{stem}")
+                os.makedirs(parent_path, exist_ok=True)
+                os.makedirs(stream_parent_path, exist_ok=True)
+                save_paths.append(save_path)
+                stream_paths.append(stream_path)
+                intermediate_prefixes.append(os.path.join(parent_path, stem))
+                meta = image_meta[file_path]
+                orig_sizes.append((meta["orig_h"], meta["orig_w"]))
+            try:
+                preds, bpps_batch = process(
+                    model, imgs, steps=args.steps, sampler=args.sampler,
+                    stream_paths=stream_paths, guidance_scale=args.guidance_scale, c_crossattn=c_crossattn,
+                    micro_batch_size=(args.micro_batch_size if args.micro_batch_size and args.micro_batch_size > 0 else None),
+                    use_fp16=bool(args.fp16),
+                    profile_memory=bool(args.profile_memory),
+                    save_intermediates=bool(args.save_intermediates),
+                    intermediate_prefixes=intermediate_prefixes if args.save_intermediates else None,
+                    latent_format=str(args.latent_format),
+                )
+            except RuntimeError as e:
+                if "CUDA out of memory" in str(e):
+                    torch.cuda.empty_cache()
+                    raise RuntimeError("CUDA OOM during sampling. Reduce --batch_size or try --micro_batch_size 1 and/or --fp16.") from e
+                else:
+                    raise
+            for pred, (orig_h, orig_w), save_path, bpp in zip(preds, orig_sizes, save_paths, bpps_batch):
+                # remove padding
+                pred = pred[:orig_h, :orig_w, :]
+                Image.fromarray(pred).save(save_path)
+                print(f"save to {save_path}, bpp {bpp}")
+                bpps.append(bpp)
 
     avg_bpp = sum(bpps) / len(bpps)
     print(f'avg bpp: {avg_bpp}')

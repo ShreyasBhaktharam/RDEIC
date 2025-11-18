@@ -1,0 +1,13 @@
+# Ignore generated data and artifacts
+outputs/
+inputs/
+train/
+weight/rdeic_2_step2.ckpt
+weight/v2-1_512-ema-pruned.ckpt
+logs/
+save_folder/
+_tmp/
+env/
+__pycache__/
+
+
