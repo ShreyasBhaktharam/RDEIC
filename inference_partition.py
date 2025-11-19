@@ -57,7 +57,8 @@ def process(
         sampler = SpacedSampler(model, var_type="fixed_small")
     else:
         sampler = DDIMSampler(model)
-    control = torch.tensor(np.stack(imgs) / 255.0, dtype=torch.float32, device=model.device).clamp_(0, 1)
+    # Keep control on CPU to reduce baseline VRAM; move per-sample slices to GPU as needed
+    control = torch.tensor(np.stack(imgs) / 255.0, dtype=torch.float32).clamp_(0, 1)
     control = einops.rearrange(control, "n h w c -> n c h w").contiguous()
     
     height, width = control.size(-2), control.size(-1)
@@ -68,7 +69,7 @@ def process(
     if profile_memory and torch.cuda.is_available() and model.device.type == "cuda":
         print(f"[mem] before compress: alloc={torch.cuda.memory_allocated() / 1e9:.3f} GB, reserved={torch.cuda.memory_reserved() / 1e9:.3f} GB")
     for i in range(n_samples):
-        control_i = control[i : i + 1]
+        control_i = control[i : i + 1].to(model.device, non_blocking=True)
         bpp_i = model.apply_condition_compress(control_i, stream_paths[i], height, width)
         c_latent_i, guide_hint_i = model.apply_condition_decompress(stream_paths[i])
         bpps.append(bpp_i)
@@ -292,6 +293,8 @@ def main() -> None:
                     intermediate_prefixes=intermediate_prefixes if args.save_intermediates else None,
                     latent_format=str(args.latent_format),
                 )
+                if torch.cuda.is_available() and args.device == "cuda":
+                    torch.cuda.empty_cache()
             except RuntimeError as e:
                 if "CUDA out of memory" in str(e):
                     torch.cuda.empty_cache()
@@ -304,6 +307,10 @@ def main() -> None:
                 Image.fromarray(pred).save(save_path)
                 print(f"save to {save_path}, bpp {bpp}")
                 bpps.append(bpp)
+            # Aggressively free CPU/GPU memory between batches
+            del preds, bpps_batch, imgs, save_paths, stream_paths, intermediate_prefixes, orig_sizes
+            if torch.cuda.is_available() and args.device == "cuda":
+                torch.cuda.empty_cache()
 
     avg_bpp = sum(bpps) / len(bpps)
     print(f'avg bpp: {avg_bpp}')

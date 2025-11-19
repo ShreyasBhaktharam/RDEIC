@@ -25,7 +25,8 @@ lightning:
     # Max number of training steps (batches).
     max_steps: 100001
     # Validation frequency in terms of training steps.
-    val_check_interval: 5000
+    # I have set it to 487 because the number of images in the training set and validation set is 487 and batch size is 1. Change it accordingly to your dataset size and batch size.
+    val_check_interval: 487
     log_every_n_steps: 200
     # Accumulate gradients from multiple batches so as to increase batch size.
     accumulate_grad_batches: 1

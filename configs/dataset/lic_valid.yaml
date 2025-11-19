@@ -2,9 +2,9 @@ dataset:
   target: dataset.licdataset.LICDataset
   params:
     # Path to the file list.
-    file_list: ./datalists/valid.list
+    file_list: ./save_folder/valid.list
     out_size: 512
-    crop_type: none
+    crop_type: center
     use_hflip: False
     use_rot: False
 
