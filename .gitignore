@@ -9,5 +9,9 @@ save_folder/
 _tmp/
 env/
 __pycache__/
+vistas/
+.vscode/
+extract_images_from_parquet.py
+keep_gpu_busy.py
 
 

@@ -856,6 +856,7 @@ class LatentDiffusion(DDPM):
 
     @torch.no_grad()
     def encode_first_stage(self, x):
+        torch.cuda.empty_cache()
         return self.first_stage_model.encode_hc(x)
     
     # @torch.no_grad()
