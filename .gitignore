@@ -9,5 +9,6 @@ save_folder/
 _tmp/
 env/
 __pycache__/
+.vscode/
 
 

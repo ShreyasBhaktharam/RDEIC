@@ -21,12 +21,12 @@ params:
   sd_locked: True
 
   # use the entire reconstruction process to fine-tuning the model
-  is_refine: False
+  is_refine: True
   fixed_step: 2
   used_timesteps: 300
 
   # Learning rate.
-  learning_rate: 1e-4
+  learning_rate: 2e-5
   l_guide_weight: 2.0
   l_bpp_weight: 1.0
   
