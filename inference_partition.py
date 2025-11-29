@@ -197,7 +197,7 @@ def parse_args() -> Namespace:
     parser.add_argument("--input", type=str, default='path to input images')
     parser.add_argument("--sampler", type=str, default="ddpm", choices=["ddpm", "ddim"])
     parser.add_argument("--steps", default=2, type=int)
-    parser.add_argument("--guidance_scale", default=1.0, type=int)
+    parser.add_argument("--guidance_scale", default=1.0, type=float)
     
     parser.add_argument("--output", type=str, default='results/')
     
