@@ -140,10 +140,10 @@ pip install -r requirements.txt
    ```
    python3 inference_partition.py \
    --ckpt_sd ./weight/v2-1_512-ema-pruned.ckpt \
-   --ckpt_lc ./weight/rdeic_2_step2.ckpt \
+   --ckpt_cc ./weight/rdeic_2_step2.ckpt \
    --config configs/model/rdeic.yaml \
-   --input path to input images \
-   --output path to output files \
+   --input inputs \
+   --output outputs \
    --steps 2 \
    --guidance_scale 1.0 \
    --device cuda 

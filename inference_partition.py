@@ -210,6 +210,9 @@ def parse_args() -> Namespace:
     parser.add_argument("--profile_memory", action="store_true", help="print CUDA memory usage before/after key steps")
     parser.add_argument("--save_intermediates", action="store_true", help="save guide hint preview and latent per image")
     parser.add_argument("--latent_format", type=str, default="pt", choices=["pt", "npy"], help="format to save latent tensors")
+    parser.add_argument("--max_long_side", type=int, default=0, help="downscale so that max(H,W) <= this (keep aspect), 0 disables")
+    parser.add_argument("--upsample_to_original", action="store_true", help="upsample outputs back to the original input resolution before saving")
+    parser.add_argument("--upsample_method", type=str, default="lanczos", choices=["lanczos", "bicubic", "bilinear", "nearest"], help="resampling method used for upsampling")
     
     return parser.parse_args()
 
@@ -251,12 +254,25 @@ def main() -> None:
     for file_path in files:
         img = Image.open(file_path).convert("RGB")
         w, h = img.size
-        # compute padded dims (multiple of 64)
-        pad_h = ((h + 63) // 64) * 64
-        pad_w = ((w + 63) // 64) * 64
+        # optionally downscale to limit working size while preserving aspect ratio
+        target_max = int(args.max_long_side) if args.max_long_side and args.max_long_side > 0 else 0
+        if target_max and max(w, h) > target_max:
+            scale = target_max / max(w, h)
+            scaled_w = max(1, int(round(w * scale)))
+            scaled_h = max(1, int(round(h * scale)))
+        else:
+            scale = 1.0
+            scaled_w, scaled_h = w, h
+        # compute padded dims (multiple of 64) after resizing
+        pad_h = ((scaled_h + 63) // 64) * 64
+        pad_w = ((scaled_w + 63) // 64) * 64
         key = (pad_h, pad_w)
         groups.setdefault(key, []).append(file_path)
-        image_meta[file_path] = {"orig_h": h, "orig_w": w}
+        image_meta[file_path] = {
+            "orig_h": h, "orig_w": w,                # original file size
+            "scaled_h": scaled_h, "scaled_w": scaled_w,  # resized working size
+            "scale": scale
+        }
     for (pad_h, pad_w), file_paths in groups.items():
         bs = max(1, int(args.batch_size))
         for i in range(0, len(file_paths), bs):
@@ -268,6 +284,9 @@ def main() -> None:
             orig_sizes = []
             for file_path in batch_files:
                 img = Image.open(file_path).convert("RGB")
+                meta = image_meta[file_path]
+                if img.size != (meta["scaled_w"], meta["scaled_h"]):
+                    img = img.resize((meta["scaled_w"], meta["scaled_h"]), Image.LANCZOS)
                 x = pad(np.array(img), scale=64)
                 imgs.append(x)
                 save_path = os.path.join(args.output, os.path.relpath(file_path, args.input))
@@ -280,8 +299,8 @@ def main() -> None:
                 save_paths.append(save_path)
                 stream_paths.append(stream_path)
                 intermediate_prefixes.append(os.path.join(parent_path, stem))
-                meta = image_meta[file_path]
-                orig_sizes.append((meta["orig_h"], meta["orig_w"]))
+                # for cropping off padding we want the resized working size
+                orig_sizes.append((meta["scaled_h"], meta["scaled_w"]))
             try:
                 preds, bpps_batch = process(
                     model, imgs, steps=args.steps, sampler=args.sampler,
@@ -301,10 +320,24 @@ def main() -> None:
                     raise RuntimeError("CUDA OOM during sampling. Reduce --batch_size or try --micro_batch_size 1 and/or --fp16.") from e
                 else:
                     raise
-            for pred, (orig_h, orig_w), save_path, bpp in zip(preds, orig_sizes, save_paths, bpps_batch):
+            # choose resample filter for optional upsampling
+            if args.upsample_method == "lanczos":
+                _resample = Image.LANCZOS
+            elif args.upsample_method == "bicubic":
+                _resample = Image.BICUBIC
+            elif args.upsample_method == "bilinear":
+                _resample = Image.BILINEAR
+            else:
+                _resample = Image.NEAREST
+            for pred, (work_h, work_w), file_path, save_path, bpp in zip(preds, orig_sizes, batch_files, save_paths, bpps_batch):
                 # remove padding
-                pred = pred[:orig_h, :orig_w, :]
-                Image.fromarray(pred).save(save_path)
+                pred = pred[:work_h, :work_w, :]
+                # optionally upsample back to original file resolution
+                meta = image_meta[file_path]
+                img_to_save = Image.fromarray(pred)
+                if args.upsample_to_original and meta["scale"] < 1.0:
+                    img_to_save = img_to_save.resize((meta["orig_w"], meta["orig_h"]), _resample)
+                img_to_save.save(save_path)
                 print(f"save to {save_path}, bpp {bpp}")
                 bpps.append(bpp)
             # Aggressively free CPU/GPU memory between batches
