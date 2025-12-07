@@ -1,0 +1,37 @@
+# Core (keep these exact)
+torch==2.2.0
+torchvision==0.17.0
+torchaudio==2.2.0
+
+# CUDA extensions that match torch 2.2.x
+xformers==0.0.25.post1
+
+# Array / utils
+numpy>=1.24,<2.0
+tqdm>=4.66
+Pillow>=10.0.0,<11
+
+# Vision libs (avoid duplicates; use headless on servers)
+opencv-python-headless==4.8.1.78
+# If you truly need GUI features, swap the above for:
+# opencv-python==4.8.1.78
+# (Do NOT install contrib + headless alongside.)
+
+# Models & training
+transformers==4.41.0
+timm==0.9.7
+einops==0.8.0
+kornia==0.7.0
+pytorch_lightning==2.2.5
+omegaconf==2.3.0
+
+# Compression / metrics
+compressai==1.2.4
+torchac==0.9.3
+pyiqa==0.1.7
+
+# CLIP ecosystem — pick ONE family; recommended:
+open_clip_torch==2.22.0
+# If you must use OpenAI’s original instead, comment out open_clip_torch and use one of:
+# clip==0.2.0
+# openai_clip==1.0.1
