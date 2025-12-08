@@ -2,6 +2,7 @@ from typing import List, Tuple, Optional
 import os
 os.environ['CUDA_VISIBLE_DEVICES'] = '0'
 from argparse import ArgumentParser, Namespace
+import time
 import warnings
 import logging
 
@@ -282,6 +283,7 @@ def main() -> None:
                 intermediate_prefixes.append(os.path.join(parent_path, stem))
                 meta = image_meta[file_path]
                 orig_sizes.append((meta["orig_h"], meta["orig_w"]))
+            start_time = time.time()
             try:
                 preds, bpps_batch = process(
                     model, imgs, steps=args.steps, sampler=args.sampler,
@@ -293,6 +295,8 @@ def main() -> None:
                     intermediate_prefixes=intermediate_prefixes if args.save_intermediates else None,
                     latent_format=str(args.latent_format),
                 )
+                gen_time = time.time() - start_time
+                per_image_time = gen_time / max(1, len(imgs))
                 if torch.cuda.is_available() and args.device == "cuda":
                     torch.cuda.empty_cache()
             except RuntimeError as e:
@@ -305,7 +309,7 @@ def main() -> None:
                 # remove padding
                 pred = pred[:orig_h, :orig_w, :]
                 Image.fromarray(pred).save(save_path)
-                print(f"save to {save_path}, bpp {bpp}")
+                print(f"save to {save_path}, bpp {bpp:.3f}, time {per_image_time:.2f}s")
                 bpps.append(bpp)
             # Aggressively free CPU/GPU memory between batches
             del preds, bpps_batch, imgs, save_paths, stream_paths, intermediate_prefixes, orig_sizes
