@@ -2,6 +2,7 @@ from typing import List, Tuple, Optional
 import os
 os.environ['CUDA_VISIBLE_DEVICES'] = '0'
 from argparse import ArgumentParser, Namespace
+import time
 import warnings
 import logging
 
@@ -198,6 +199,7 @@ def parse_args() -> Namespace:
     parser.add_argument("--sampler", type=str, default="ddpm", choices=["ddpm", "ddim"])
     parser.add_argument("--steps", default=2, type=int)
     parser.add_argument("--guidance_scale", default=1.0, type=float)
+    parser.add_argument("--guidance_scale", default=1.0, type=float)
     
     parser.add_argument("--output", type=str, default='results/')
     
@@ -301,6 +303,7 @@ def main() -> None:
                 intermediate_prefixes.append(os.path.join(parent_path, stem))
                 # for cropping off padding we want the resized working size
                 orig_sizes.append((meta["scaled_h"], meta["scaled_w"]))
+            start_time = time.time()
             try:
                 preds, bpps_batch = process(
                     model, imgs, steps=args.steps, sampler=args.sampler,
@@ -312,6 +315,8 @@ def main() -> None:
                     intermediate_prefixes=intermediate_prefixes if args.save_intermediates else None,
                     latent_format=str(args.latent_format),
                 )
+                gen_time = time.time() - start_time
+                per_image_time = gen_time / max(1, len(imgs))
                 if torch.cuda.is_available() and args.device == "cuda":
                     torch.cuda.empty_cache()
             except RuntimeError as e:
@@ -338,7 +343,7 @@ def main() -> None:
                 if args.upsample_to_original and meta["scale"] < 1.0:
                     img_to_save = img_to_save.resize((meta["orig_w"], meta["orig_h"]), _resample)
                 img_to_save.save(save_path)
-                print(f"save to {save_path}, bpp {bpp}")
+                print(f"save to {save_path}, bpp {bpp:.3f}, time {per_image_time:.2f}s")
                 bpps.append(bpp)
             # Aggressively free CPU/GPU memory between batches
             del preds, bpps_batch, imgs, save_paths, stream_paths, intermediate_prefixes, orig_sizes

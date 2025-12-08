@@ -142,10 +142,9 @@ pip install -r requirements.txt
    --ckpt_sd ./weight/v2-1_512-ema-pruned.ckpt \
    --ckpt_cc ./weight/rdeic_2_step2.ckpt \
    --config configs/model/rdeic.yaml \
-   --input inputs \
+   --input inputs/0001000 \
    --output outputs \
    --steps 2 \
-   --guidance_scale 1.0 \
    --device cuda 
    ```
 
