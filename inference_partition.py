@@ -13,6 +13,8 @@ import pytorch_lightning as pl
 from PIL import Image
 from omegaconf import OmegaConf
 
+from transformers import BlipForConditionalGeneration, BlipProcessor
+
 from ldm.xformers_state import disable_xformers
 from model.spaced_sampler_relay import SpacedSampler
 from model.ddim_sampler_relay import DDIMSampler
@@ -20,6 +22,44 @@ from model.rdeic import RDEIC
 from utils.image import pad
 from utils.common import instantiate_from_config, load_state_dict
 from utils.file import list_image_files, get_file_name_parts
+
+_caption_cache = {
+    "model_id": None,
+    "device": None,
+    "model": None,
+    "processor": None,
+}
+
+
+def load_captioner(model_id: str, device: str):
+    """
+    Load (and cache) a BLIP captioning model on the requested device.
+    """
+    if (
+        _caption_cache["model_id"] != model_id
+        or _caption_cache["device"] != device
+        or _caption_cache["model"] is None
+        or _caption_cache["processor"] is None
+    ):
+        processor = BlipProcessor.from_pretrained(model_id)
+        model = BlipForConditionalGeneration.from_pretrained(model_id).to(device)
+        model.eval()
+        _caption_cache.update(
+            {"model_id": model_id, "device": device, "model": model, "processor": processor}
+        )
+    return _caption_cache["model"], _caption_cache["processor"]
+
+
+@torch.no_grad()
+def generate_caption(image: Image.Image, model_id: str, device: str) -> str:
+    """
+    Run BLIP on a single image and return a decoded caption string.
+    """
+    blip_model, blip_processor = load_captioner(model_id, device)
+    inputs = blip_processor(images=image, return_tensors="pt").to(device)
+    generated_ids = blip_model.generate(**inputs, max_new_tokens=64)
+    caption = blip_processor.decode(generated_ids[0], skip_special_tokens=True)
+    return caption.strip()
 
 
 @torch.no_grad()
@@ -31,6 +71,7 @@ def process(
     stream_paths: List[str],
     guidance_scale: float,
     c_crossattn: List[torch.Tensor],
+    uc_crossattn: Optional[List[torch.Tensor]] = None,
     micro_batch_size: Optional[int] = None,
     use_fp16: bool = False,
     profile_memory: bool = False,
@@ -39,7 +80,7 @@ def process(
     latent_format: str = "pt",
 ) -> Tuple[List[np.ndarray], List[float]]:
     """
-    Apply RDEIC model on a list of images.
+    Apply RDEIC model on a list of images with CFG over text prompts.
     
     Args:
         model (RDEIC): Model.
@@ -47,6 +88,8 @@ def process(
         sampler (str): Sampler name.
         steps (int): Sampling steps.
         stream_paths (List[str]): List of savedirs for bitstreams, one per image
+        c_crossattn (List[Tensor]): Conditional text embeddings (e.g., BLIP captions).
+        uc_crossattn (List[Tensor], optional): Unconditional text embeddings (e.g., empty prompt).
     
     Returns:
         preds (List[np.ndarray]): Restoration results (HWC, RGB, range in [0, 255]).
@@ -135,14 +178,28 @@ def process(
         guide_hint_chunk = guide_hint[start:end]
         # repeat text conditioning to chunk size if needed
         if isinstance(c_crossattn, list) and len(c_crossattn) > 0 and hasattr(c_crossattn[0], "shape"):
-            c_crossattn_chunk = [c_crossattn[0].repeat(bs, 1, 1)]
+            c_crossattn_chunk = [c_crossattn[0][start:end]]
         else:
             c_crossattn_chunk = c_crossattn
+        if uc_crossattn is not None:
+            if isinstance(uc_crossattn, list) and len(uc_crossattn) > 0 and hasattr(uc_crossattn[0], "shape"):
+                uc_crossattn_chunk = [uc_crossattn[0][start:end]]
+            else:
+                uc_crossattn_chunk = uc_crossattn
+        else:
+            uc_crossattn_chunk = None
         cond_chunk = {
             "c_latent": [c_latent_chunk],
             "c_crossattn": c_crossattn_chunk,
             "guide_hint": guide_hint_chunk
         }
+        uc_chunk = None
+        if uc_crossattn_chunk is not None:
+            uc_chunk = {
+                "c_latent": [c_latent_chunk],
+                "c_crossattn": uc_crossattn_chunk,
+                "guide_hint": guide_hint_chunk,
+            }
         shape = (bs, latent_shape[1], latent_shape[2], latent_shape[3])
         # Create noise only once per chunk
         t = torch.ones((bs,)).long().to(model.device) * model.used_timesteps - 1
@@ -162,14 +219,14 @@ def process(
                 samples_chunk = sampler.sample(
                     steps, shape, cond_chunk,
                     unconditional_guidance_scale=guidance_scale,
-                    unconditional_conditioning=None,
+                    unconditional_conditioning=uc_chunk,
                     cond_fn=None, x_T=x_T
                 )
             else:
                 sampler_ddim: DDIMSampler = sampler
                 samples_chunk, _ = sampler_ddim.sample(
                     S=steps, batch_size=shape[0], shape=shape[1:],
-                    conditioning=cond_chunk, unconditional_conditioning=None,
+                    conditioning=cond_chunk, unconditional_conditioning=uc_chunk,
                     unconditional_guidance_scale=guidance_scale,
                     x_T=x_T, eta=0
                 )
@@ -199,12 +256,14 @@ def parse_args() -> Namespace:
     parser.add_argument("--sampler", type=str, default="ddpm", choices=["ddpm", "ddim"])
     parser.add_argument("--steps", default=2, type=int)
     parser.add_argument("--guidance_scale", default=1.0, type=float)
-    parser.add_argument("--guidance_scale", default=1.0, type=float)
     
     parser.add_argument("--output", type=str, default='results/')
     
     parser.add_argument("--seed", type=int, default=231)
     parser.add_argument("--device", type=str, default="cuda", choices=["cpu", "cuda"])
+    parser.add_argument("--use_captions", action="store_true", help="enable BLIP captioning + CFG over captions")
+    parser.add_argument("--caption_device", type=str, default=None, help="device for BLIP captioning (defaults to --device)")
+    parser.add_argument("--caption_model", type=str, default="Salesforce/blip-image-captioning-base", help="BLIP model id for captioning")
     parser.add_argument("--batch_size", type=int, default=1, help="number of images to process together (grouped by resolution)")
     parser.add_argument("--suppress_warnings", action="store_true", help="suppress Python warnings and set logging to ERROR")
     parser.add_argument("--micro_batch_size", type=int, default=0, help="split each batch into smaller chunks during sampling to reduce VRAM")
@@ -213,6 +272,7 @@ def parse_args() -> Namespace:
     parser.add_argument("--save_intermediates", action="store_true", help="save guide hint preview and latent per image")
     parser.add_argument("--latent_format", type=str, default="pt", choices=["pt", "npy"], help="format to save latent tensors")
     parser.add_argument("--max_long_side", type=int, default=0, help="downscale so that max(H,W) <= this (keep aspect), 0 disables")
+    parser.add_argument("--enable_resize_guard", action="store_true", help="enable down/upsampling guard for large images")
     parser.add_argument("--upsample_to_original", action="store_true", help="upsample outputs back to the original input resolution before saving")
     parser.add_argument("--upsample_method", type=str, default="lanczos", choices=["lanczos", "bicubic", "bilinear", "nearest"], help="resampling method used for upsampling")
     
@@ -246,23 +306,37 @@ def main() -> None:
     
     assert os.path.isdir(args.input)
 
-    c_crossattn =  [model.get_learned_conditioning([""])]
+    if args.use_captions:
+        caption_device = args.caption_device if args.caption_device is not None else args.device
+        if caption_device.startswith("cuda") and not torch.cuda.is_available():
+            caption_device = "cpu"
+    else:
+        caption_device = None
     
     print(f"sampling {args.steps} steps using {args.sampler} sampler")
     # Group files by padded resolution so they can be batched safely
-    files = list(list_image_files(args.input, follow_links=True))
+    files = sorted(list_image_files(args.input, follow_links=True))
     groups = {}
     image_meta = {}
     for file_path in files:
         img = Image.open(file_path).convert("RGB")
         w, h = img.size
-        # optionally downscale to limit working size while preserving aspect ratio
-        target_max = int(args.max_long_side) if args.max_long_side and args.max_long_side > 0 else 0
-        if target_max and max(w, h) > target_max:
-            scale = target_max / max(w, h)
-            scaled_w = max(1, int(round(w * scale)))
-            scaled_h = max(1, int(round(h * scale)))
+        if args.use_captions:
+            caption = generate_caption(img, model_id=args.caption_model, device=caption_device)
         else:
+            caption = ""
+        # optionally downscale to limit working size while preserving aspect ratio
+        if args.enable_resize_guard:
+            target_max = int(args.max_long_side) if args.max_long_side and args.max_long_side > 0 else 0
+            if target_max and max(w, h) > target_max:
+                scale = target_max / max(w, h)
+                scaled_w = max(1, int(round(w * scale)))
+                scaled_h = max(1, int(round(h * scale)))
+            else:
+                scale = 1.0
+                scaled_w, scaled_h = w, h
+        else:
+            target_max = 0
             scale = 1.0
             scaled_w, scaled_h = w, h
         # compute padded dims (multiple of 64) after resizing
@@ -273,9 +347,11 @@ def main() -> None:
         image_meta[file_path] = {
             "orig_h": h, "orig_w": w,                # original file size
             "scaled_h": scaled_h, "scaled_w": scaled_w,  # resized working size
-            "scale": scale
+            "scale": scale,
+            "caption": caption,
         }
-    for (pad_h, pad_w), file_paths in groups.items():
+    for (pad_h, pad_w) in sorted(groups.keys()):
+        file_paths = sorted(groups[(pad_h, pad_w)])
         bs = max(1, int(args.batch_size))
         for i in range(0, len(file_paths), bs):
             batch_files = file_paths[i:i + bs]
@@ -284,6 +360,7 @@ def main() -> None:
             stream_paths = []
             intermediate_prefixes = []
             orig_sizes = []
+            captions = []
             for file_path in batch_files:
                 img = Image.open(file_path).convert("RGB")
                 meta = image_meta[file_path]
@@ -303,11 +380,21 @@ def main() -> None:
                 intermediate_prefixes.append(os.path.join(parent_path, stem))
                 # for cropping off padding we want the resized working size
                 orig_sizes.append((meta["scaled_h"], meta["scaled_w"]))
+                captions.append(meta["caption"])
+            if args.use_captions:
+                text_cond = model.get_learned_conditioning(captions)
+                uc_cond = model.get_learned_conditioning([""] * len(captions))
+                c_crossattn = [text_cond]
+                uc_crossattn = [uc_cond]
+            else:
+                c_crossattn = [model.get_learned_conditioning([""] * len(captions))]
+                uc_crossattn = None
             start_time = time.time()
             try:
                 preds, bpps_batch = process(
                     model, imgs, steps=args.steps, sampler=args.sampler,
                     stream_paths=stream_paths, guidance_scale=args.guidance_scale, c_crossattn=c_crossattn,
+                    uc_crossattn=uc_crossattn,
                     micro_batch_size=(args.micro_batch_size if args.micro_batch_size and args.micro_batch_size > 0 else None),
                     use_fp16=bool(args.fp16),
                     profile_memory=bool(args.profile_memory),
@@ -340,7 +427,7 @@ def main() -> None:
                 # optionally upsample back to original file resolution
                 meta = image_meta[file_path]
                 img_to_save = Image.fromarray(pred)
-                if args.upsample_to_original and meta["scale"] < 1.0:
+                if args.enable_resize_guard and args.upsample_to_original and meta["scale"] < 1.0:
                     img_to_save = img_to_save.resize((meta["orig_w"], meta["orig_h"]), _resample)
                 img_to_save.save(save_path)
                 print(f"save to {save_path}, bpp {bpp:.3f}, time {per_image_time:.2f}s")
