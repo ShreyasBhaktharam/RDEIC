@@ -3,7 +3,7 @@ dataset:
   params:
     # Path to the file list.
     file_list: ./save_folder/train.list
-    out_size: 512
+    out_size: 256
     crop_type: center
     use_hflip: True
     use_rot: False
