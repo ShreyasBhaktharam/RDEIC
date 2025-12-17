@@ -1,0 +1,23 @@
+RDEIC Robustness Failure Thresholds
+==================================================
+
+PSNR:
+  Threshold: 25.0
+  Failure at: 0.0% error rate
+  Value at failure: 22.5208
+
+SSIM:
+  Threshold: 0.85
+  Failure at: 0.0% error rate
+  Value at failure: 0.6165
+
+MS_SSIM:
+  Threshold: 0.9
+  Failure at: 0.0% error rate
+  Value at failure: 0.8994
+
+LPIPS:
+  Threshold: 0.3
+  Failure at: >10%% error rate
+  Value at failure: 0.2709
+

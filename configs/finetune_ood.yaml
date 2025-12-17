@@ -1,0 +1,55 @@
+# Fine-tuning config for OOD domain adaptation
+# 
+# Usage:
+#   1. Generate OOD training list: 
+#      find vistas_test/ -name "*.jpg" | head -50 > datalists/ood_train.list
+#   2. Run fine-tuning:
+#      python train.py --config configs/finetune_ood.yaml
+#
+# This performs LIGHT adaptation (preprocess_model + control_model only).
+# The diffusion UNet remains frozen (sd_locked: True).
+
+data:
+  target: dataset.data_module.DataModule
+  params:
+    train_config: ./configs/dataset/ood_finetune.yaml
+    val_config: ./configs/dataset/ood_satellite_valid_fast.yaml
+
+model:
+  # Model config with lower learning rate for fine-tuning
+  config: ./configs/model/rdeic_finetune_ood.yaml
+  # Resume from pretrained RDEIC checkpoint
+  resume: ./weight/rdeic_2_step2.ckpt
+
+lightning:
+  seed: 231
+  
+  trainer:
+    accelerator: ddp
+    precision: 32
+    gpus: [0]
+    default_root_dir: ./logs/ood_finetune
+    # Fewer steps for fine-tuning
+    max_steps: 5000
+    # Validate less frequently to speed up training
+    val_check_interval: 500
+    log_every_n_steps: 50
+    accumulate_grad_batches: 1
+  
+  callbacks:
+    - target: model.callbacks.ImageLogger
+      params:
+        log_every_n_steps: 250
+        log_start_step: 0
+        max_images_each_step: 2
+        log_images_kwargs: ~
+
+    - target: model.callbacks.ModelCheckpoint
+      params:
+        every_n_train_steps: 500
+        monitor: "T/loss"
+        mode: "min"
+        save_top_k: 3
+        filename: "ood_finetune_{step}"
+
+

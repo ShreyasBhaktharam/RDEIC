@@ -1,0 +1,18 @@
+dataset:
+  target: dataset.licdataset.LICDataset
+  params:
+    # Path to the OOD satellite validation file list
+    file_list: ./datalists/ood_satellite_valid.list
+    out_size: 512
+    crop_type: center
+    use_hflip: False
+    use_rot: False
+
+data_loader:
+  batch_size: 1
+  shuffle: false
+  num_workers: 1  # Reduced from 4 to speed up validation
+  drop_last: true
+
+batch_transform:
+  target: dataset.batch_transform.IdentityBatchTransform

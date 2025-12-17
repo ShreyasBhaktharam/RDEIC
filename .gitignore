@@ -13,5 +13,7 @@ vistas/
 .vscode/
 extract_images_from_parquet.py
 keep_gpu_busy.py
+img_set3/  
+
 
 

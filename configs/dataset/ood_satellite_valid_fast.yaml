@@ -1,0 +1,18 @@
+dataset:
+  target: dataset.licdataset.LICDataset
+  params:
+    # Path to the small OOD satellite validation file list (500 images)
+    file_list: ./datalists/ood_satellite_valid_small.list
+    out_size: 512
+    crop_type: center
+    use_hflip: False
+    use_rot: False
+
+data_loader:
+  batch_size: 1
+  shuffle: false
+  num_workers: 1
+  drop_last: true
+
+batch_transform:
+  target: dataset.batch_transform.IdentityBatchTransform

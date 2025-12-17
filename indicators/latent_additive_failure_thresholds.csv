@@ -1,0 +1,5 @@
+metric,threshold,failure_rate,metric_at_failure
+psnr,25.0,0.0,22.520842361450196
+ssim,0.85,0.0,0.6165039380391438
+ms_ssim,0.9,0.0,0.8994181394577027
+lpips,0.3,>10%,0.2708500881989797
