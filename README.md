@@ -50,8 +50,8 @@
 
 We investigate the model's behavior under noisy channel conditions by simulating transmission errors at two levels:
 
-- **Bitstream-level corruption**: Bit flips before entropy decoding at error rates $p \in \{0\%, 0.1\%, 0.5\%, 1\%, 2\%, 5\%, 10\%\}$ (random and burst errors)
-- **Latent-level corruption**: Gaussian additive noise ($\sigma \in \{0, 5, 10, 20, 50, 100\}$) and mask-replace corruption on decoded latents
+- **Bitstream-level corruption**: Bit flips before entropy decoding at error rates at 0.1%, 0.2%, 0.5%, 1%, 5% and 10% (random and burst errors)
+- **Latent-level corruption**: Gaussian additive noise and mask-replace corruption on decoded latents
 
 **Key Findings:**
 - **Bitstream corruption is catastrophic**: At 0.1% random bit error rate, quality degrades dramatically (PSNR: 22.5→9.07 dB, MS-SSIM: 0.90→0.13, LPIPS: 0.08→0.88). Decode failures begin at 0.5% (66.7%), reaching 100% at 2%+.
@@ -226,6 +226,14 @@ This light fine-tuning approach requires ~30 minutes on L4 GPU and enables effec
 ## <a name="todo"></a>:memo: TODO
 - [x] Release code
 - [x] Release pretrained models
+
+## <a name="authors"></a>:writing_hand: Authors
+
+**Robustness and Generalization Analysis:**
+- Harshini Vijayajumar - hv2201
+- Shreyas Bhaktharam - sb9855
+- Siddhant Mohan - sm12766
+- Saketh Raman Ramesh - sr7714
 
 ## <a name="acknowledgement"></a>:heart: Acknowledgement
 This work is based on [DiffEIC](https://github.com/huai-chang/DiffEIC) and [CVQ-VAE](https://github.com/lyndonzheng/cvq-vae), thanks to their invaluable contributions.
