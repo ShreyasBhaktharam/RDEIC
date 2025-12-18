@@ -229,7 +229,6 @@ This light fine-tuning approach requires ~30 minutes on L4 GPU and enables effec
 
 ## <a name="authors"></a>:writing_hand: Authors
 
-**Robustness and Generalization Analysis:**
 - Harshini Vijayajumar - hv2201
 - Shreyas Bhaktharam - sb9855
 - Siddhant Mohan - sm12766
