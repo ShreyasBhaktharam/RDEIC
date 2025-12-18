@@ -7,13 +7,14 @@ import warnings
 import logging
 
 import numpy as np
+import pandas as pd
 import torch
 import einops
 import pytorch_lightning as pl
 from PIL import Image
 from omegaconf import OmegaConf
 
-from transformers import BlipForConditionalGeneration, BlipProcessor
+from transformers import AutoModelForVision2Seq, AutoProcessor
 
 from ldm.xformers_state import disable_xformers
 from model.spaced_sampler_relay import SpacedSampler
@@ -22,6 +23,44 @@ from model.rdeic import RDEIC
 from utils.image import pad
 from utils.common import instantiate_from_config, load_state_dict
 from utils.file import list_image_files, get_file_name_parts
+
+
+def compute_metrics(pred: np.ndarray, target: np.ndarray, device: str = "cuda") -> dict:
+    """
+    Compute PSNR, SSIM, MS-SSIM, and LPIPS using pyiqa (matches baseline_inference).
+    """
+    import pyiqa
+
+    pred_t = torch.from_numpy(pred).float().permute(2, 0, 1).unsqueeze(0) / 255.0
+    target_t = torch.from_numpy(target).float().permute(2, 0, 1).unsqueeze(0) / 255.0
+
+    pred_t = pred_t.to(device)
+    target_t = target_t.to(device)
+
+    metrics = {}
+
+    mse = torch.mean((pred_t - target_t) ** 2)
+    metrics["psnr"] = (10 * torch.log10(1.0 / (mse + 1e-10))).item()
+
+    try:
+        ssim_fn = pyiqa.create_metric("ssim", device=device)
+        metrics["ssim"] = ssim_fn(pred_t, target_t).item()
+    except Exception:
+        metrics["ssim"] = float("nan")
+
+    try:
+        msssim_fn = pyiqa.create_metric("ms_ssim", device=device)
+        metrics["ms_ssim"] = msssim_fn(pred_t, target_t).item()
+    except Exception:
+        metrics["ms_ssim"] = float("nan")
+
+    try:
+        lpips_fn = pyiqa.create_metric("lpips", device=device)
+        metrics["lpips"] = lpips_fn(pred_t, target_t).item()
+    except Exception:
+        metrics["lpips"] = float("nan")
+
+    return metrics
 
 _caption_cache = {
     "model_id": None,
@@ -33,7 +72,7 @@ _caption_cache = {
 
 def load_captioner(model_id: str, device: str):
     """
-    Load (and cache) a BLIP captioning model on the requested device.
+    Load (and cache) a Qwen2-VL captioning model on the requested device.
     """
     if (
         _caption_cache["model_id"] != model_id
@@ -41,8 +80,11 @@ def load_captioner(model_id: str, device: str):
         or _caption_cache["model"] is None
         or _caption_cache["processor"] is None
     ):
-        processor = BlipProcessor.from_pretrained(model_id)
-        model = BlipForConditionalGeneration.from_pretrained(model_id).to(device)
+        dtype = torch.float16 if device.startswith("cuda") else torch.float32
+        processor = AutoProcessor.from_pretrained(model_id, trust_remote_code=True)
+        model = AutoModelForVision2Seq.from_pretrained(
+            model_id, trust_remote_code=True, torch_dtype=dtype
+        ).to(device)
         model.eval()
         _caption_cache.update(
             {"model_id": model_id, "device": device, "model": model, "processor": processor}
@@ -51,15 +93,47 @@ def load_captioner(model_id: str, device: str):
 
 
 @torch.no_grad()
-def generate_caption(image: Image.Image, model_id: str, device: str) -> str:
-    """
-    Run BLIP on a single image and return a decoded caption string.
-    """
-    blip_model, blip_processor = load_captioner(model_id, device)
-    inputs = blip_processor(images=image, return_tensors="pt").to(device)
-    generated_ids = blip_model.generate(**inputs, max_new_tokens=64)
-    caption = blip_processor.decode(generated_ids[0], skip_special_tokens=True)
-    return caption.strip()
+def generate_caption(image, model_id: str, device: str, prompt: str) -> str:
+    model, processor = load_captioner(model_id, device)
+    tokenizer = processor.tokenizer  # important
+
+    system = (
+        "You are a vision assistant. Follow the user's instructions exactly. "
+        "Do not output code or explanations."
+    )
+
+    messages = [
+        {"role": "system", "content": system},
+        # IMPORTANT: Qwen-VL expects image placeholder + text in the user content
+        {"role": "user", "content": [{"type": "image"}, {"type": "text", "text": prompt}]},
+    ]
+
+    # Turn messages into a single string prompt (chat template)
+    text = tokenizer.apply_chat_template(
+        messages,
+        tokenize=False,
+        add_generation_prompt=True
+    )
+
+    inputs = processor(
+        text=text,
+        images=image,
+        return_tensors="pt"
+    ).to(device)
+
+    generated_ids = model.generate(
+        **inputs,
+        max_new_tokens=256,
+        do_sample=False,
+    )
+
+    # Strip the prompt tokens so decode returns only the assistant output
+    generated_ids = generated_ids[:, inputs["input_ids"].shape[1]:]
+
+    out = processor.batch_decode(generated_ids, skip_special_tokens=True)[0]
+    return out.strip()
+
+
 
 
 @torch.no_grad()
@@ -88,7 +162,7 @@ def process(
         sampler (str): Sampler name.
         steps (int): Sampling steps.
         stream_paths (List[str]): List of savedirs for bitstreams, one per image
-        c_crossattn (List[Tensor]): Conditional text embeddings (e.g., BLIP captions).
+        c_crossattn (List[Tensor]): Conditional text embeddings (e.g., caption embeddings).
         uc_crossattn (List[Tensor], optional): Unconditional text embeddings (e.g., empty prompt).
     
     Returns:
@@ -261,9 +335,10 @@ def parse_args() -> Namespace:
     
     parser.add_argument("--seed", type=int, default=231)
     parser.add_argument("--device", type=str, default="cuda", choices=["cpu", "cuda"])
-    parser.add_argument("--use_captions", action="store_true", help="enable BLIP captioning + CFG over captions")
-    parser.add_argument("--caption_device", type=str, default=None, help="device for BLIP captioning (defaults to --device)")
-    parser.add_argument("--caption_model", type=str, default="Salesforce/blip-image-captioning-base", help="BLIP model id for captioning")
+    parser.add_argument("--max_images", type=int, default=0, help="if >0, process only the first N images in sorted order")
+    parser.add_argument("--use_captions", action="store_true", help="enable captioning + CFG over captions")
+    parser.add_argument("--caption_device", type=str, default=None, help="device for captioning (defaults to --device)")
+    parser.add_argument("--caption_model", type=str, default="Qwen/Qwen2-VL-2B-Instruct", help="Path or HF ID for Qwen2-VL-2B-Instruct captioning model")
     parser.add_argument("--batch_size", type=int, default=1, help="number of images to process together (grouped by resolution)")
     parser.add_argument("--suppress_warnings", action="store_true", help="suppress Python warnings and set logging to ERROR")
     parser.add_argument("--micro_batch_size", type=int, default=0, help="split each batch into smaller chunks during sampling to reduce VRAM")
@@ -303,8 +378,10 @@ def main() -> None:
     model.to(args.device)
 
     bpps = []
+    metrics_results = []
     
     assert os.path.isdir(args.input)
+    os.makedirs(args.output, exist_ok=True)
 
     if args.use_captions:
         caption_device = args.caption_device if args.caption_device is not None else args.device
@@ -316,13 +393,33 @@ def main() -> None:
     print(f"sampling {args.steps} steps using {args.sampler} sampler")
     # Group files by padded resolution so they can be batched safely
     files = sorted(list_image_files(args.input, follow_links=True))
+    if args.max_images and args.max_images > 0:
+        idxs = [113, 117, 274, 276, 288, 510, 570, 648, 650, 651, 671, 672, 674, 772, 867, 884, 905, 911]
+        files = [files[ind-1] for ind in idxs]
+        #files = files[:args.max_images]
     groups = {}
     image_meta = {}
     for file_path in files:
         img = Image.open(file_path).convert("RGB")
         w, h = img.size
         if args.use_captions:
-            caption = generate_caption(img, model_id=args.caption_model, device=caption_device)
+            # Hard-coded instruction prompt to bias captions toward reading in-image text.
+            caption_prompt = """
+Look only at the provided image.
+
+Output exactly in this format:
+
+Visible text:
+- "<TEXT>" (approximate position)
+
+Rules:
+- Transcribe only text visible in the image.
+- Preserve capitalization, punctuation, symbols, and line breaks.
+- Do not paraphrase or add text.
+- If no readable text is present, write: No readable text.
+
+            """
+            caption = generate_caption(img, model_id=args.caption_model, device=caption_device, prompt=caption_prompt)
         else:
             caption = ""
         # optionally downscale to limit working size while preserving aspect ratio
@@ -361,12 +458,17 @@ def main() -> None:
             intermediate_prefixes = []
             orig_sizes = []
             captions = []
+            target_infos = []
             for file_path in batch_files:
-                img = Image.open(file_path).convert("RGB")
+                img_full = Image.open(file_path).convert("RGB")
+                orig_np = np.array(img_full)
                 meta = image_meta[file_path]
-                if img.size != (meta["scaled_w"], meta["scaled_h"]):
-                    img = img.resize((meta["scaled_w"], meta["scaled_h"]), Image.LANCZOS)
-                x = pad(np.array(img), scale=64)
+                if img_full.size != (meta["scaled_w"], meta["scaled_h"]):
+                    img_scaled = img_full.resize((meta["scaled_w"], meta["scaled_h"]), Image.LANCZOS)
+                else:
+                    img_scaled = img_full
+                scaled_np = np.array(img_scaled)
+                x = pad(scaled_np, scale=64)
                 imgs.append(x)
                 save_path = os.path.join(args.output, os.path.relpath(file_path, args.input))
                 parent_path, stem, _ = get_file_name_parts(save_path)
@@ -381,6 +483,7 @@ def main() -> None:
                 # for cropping off padding we want the resized working size
                 orig_sizes.append((meta["scaled_h"], meta["scaled_w"]))
                 captions.append(meta["caption"])
+                target_infos.append({"original": orig_np, "scaled": scaled_np, "meta": meta, "rel_path": os.path.relpath(file_path, args.input)})
             if args.use_captions:
                 text_cond = model.get_learned_conditioning(captions)
                 uc_cond = model.get_learned_conditioning([""] * len(captions))
@@ -421,7 +524,7 @@ def main() -> None:
                 _resample = Image.BILINEAR
             else:
                 _resample = Image.NEAREST
-            for pred, (work_h, work_w), file_path, save_path, bpp in zip(preds, orig_sizes, batch_files, save_paths, bpps_batch):
+            for pred, target_info, (work_h, work_w), file_path, save_path, bpp in zip(preds, target_infos, orig_sizes, batch_files, save_paths, bpps_batch):
                 # remove padding
                 pred = pred[:work_h, :work_w, :]
                 # optionally upsample back to original file resolution
@@ -430,15 +533,42 @@ def main() -> None:
                 if args.enable_resize_guard and args.upsample_to_original and meta["scale"] < 1.0:
                     img_to_save = img_to_save.resize((meta["orig_w"], meta["orig_h"]), _resample)
                 img_to_save.save(save_path)
-                print(f"save to {save_path}, bpp {bpp:.3f}, time {per_image_time:.2f}s")
+                pred_for_metric = np.array(img_to_save)
+                if args.enable_resize_guard and args.upsample_to_original and meta["scale"] < 1.0:
+                    target_np = target_info["original"]
+                else:
+                    target_np = target_info["scaled"]
+                metric_vals = compute_metrics(pred_for_metric, target_np, device=args.device)
+                metrics_results.append({
+                    "image": target_info["rel_path"],
+                    "bpp": bpp,
+                    "scale": meta["scale"],
+                    **metric_vals,
+                })
+                if args.use_captions:
+                    print(f"caption: \"{meta['caption']}\"")
+                print(
+                    f"save to {save_path}, bpp {bpp:.3f}, "
+                    f"PSNR {metric_vals['psnr']:.2f}dB, SSIM {metric_vals['ssim']:.4f}, "
+                    f"LPIPS {metric_vals['lpips']:.4f}, time {per_image_time:.2f}s"
+                )
                 bpps.append(bpp)
             # Aggressively free CPU/GPU memory between batches
-            del preds, bpps_batch, imgs, save_paths, stream_paths, intermediate_prefixes, orig_sizes
+            del preds, bpps_batch, imgs, save_paths, stream_paths, intermediate_prefixes, orig_sizes, target_infos
             if torch.cuda.is_available() and args.device == "cuda":
                 torch.cuda.empty_cache()
 
     avg_bpp = sum(bpps) / len(bpps)
     print(f'avg bpp: {avg_bpp}')
+    if metrics_results:
+        df = pd.DataFrame(metrics_results)
+        metrics_path = os.path.join(args.output, "metrics.csv")
+        df.to_csv(metrics_path, index=False)
+        print(f"Mean PSNR: {df['psnr'].mean():.2f} dB")
+        print(f"Mean SSIM: {df['ssim'].mean():.4f}")
+        print(f"Mean MS-SSIM: {df['ms_ssim'].mean():.4f}")
+        print(f"Mean LPIPS: {df['lpips'].mean():.4f}")
+        print(f"Metrics saved to {metrics_path}")
             
 
 if __name__ == "__main__":

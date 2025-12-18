@@ -143,9 +143,11 @@ pip install -r requirements.txt
    --ckpt_cc ./weight/rdeic_2_step2.ckpt \
    --config configs/model/rdeic.yaml \
    --input inputs/0001000 \
-   --output outputs \
+   --output outputs/withCaption1aug2 \
    --steps 2 \
-   --device cuda 
+   --device cuda
+   --use_captions
+
    ```
 
 
